@@ -26,6 +26,7 @@ class Step1XParams:
     axes_dim: list[int]
     theta: int
     qkv_bias: bool
+    mode: str
 
 
 class Step1XEdit(nn.Module):
@@ -65,6 +66,7 @@ class Step1XEdit(nn.Module):
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
+                    mode=params.mode
                 )
                 for _ in range(params.depth)
             ]
@@ -73,7 +75,7 @@ class Step1XEdit(nn.Module):
         self.single_blocks = nn.ModuleList(
             [
                 SingleStreamBlock(
-                    self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio
+                    self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, mode=params.mode
                 )
                 for _ in range(params.depth_single_blocks)
             ]

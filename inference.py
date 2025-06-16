@@ -5,6 +5,7 @@ import itertools
 import math
 import os
 import time
+import functools
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,32 @@ import sampling
 from modules.autoencoder import AutoEncoder
 from modules.conditioner import Qwen25VL_7b_Embedder as Qwen2VLEmbedder
 from modules.model_edit import Step1XParams, Step1XEdit
+from modules.multigpu import parallel_transformer, teacache_transformer, parallel_teacache_transformer
+
+from torch import Tensor
+import torch.distributed as dist
+from xfuser.core.distributed import (
+    get_world_group,
+    initialize_model_parallel,
+)
+
+def cfg_usp_level_setting(ring_degree: int = 1, ulysses_degree: int = 1, cfg_degree: int = 1):
+    # restriction: dist.get_world_size() == <cfg_degree> x <ring_degree> x <ulysses_degree>
+    initialize_model_parallel(
+        ring_degree=ring_degree,
+        ulysses_degree=ulysses_degree,
+        classifier_free_guidance_degree=cfg_degree,
+    )
+
+def teacache_init(pipe, args):
+    pipe.dit.__class__.enable_teacache = True
+    pipe.dit.__class__.cnt = 0
+    pipe.dit.__class__.num_steps = args.num_steps
+    pipe.dit.__class__.rel_l1_thresh = args.teacache_threshold
+    pipe.dit.__class__.accumulated_rel_l1_distance = 0
+    pipe.dit.__class__.previous_modulated_input = None
+    pipe.dit.__class__.previous_residual = None
+
 
 def cudagc():
     torch.cuda.empty_cache()
@@ -48,6 +75,7 @@ def load_models(
     dit_path=None,
     ae_path=None,
     qwen2vl_model_path=None,
+    mode="flash",
     device="cuda",
     max_length=256,
     dtype=torch.bfloat16,
@@ -85,6 +113,7 @@ def load_models(
             axes_dim=[16, 56, 56],
             theta=10_000,
             qkv_bias=True,
+            mode=mode
         )
         dit = Step1XEdit(step1x_params)
 
@@ -121,15 +150,23 @@ class ImageGenerator:
         quantized=False,
         offload=False,
         lora=None,
+        mode="flash"
     ) -> None:
-        self.device = torch.device(device)
+        if os.getenv("TORCHELASTIC_RUN_ID") is not None:
+            local_rank = get_world_group().local_rank
+            torch.cuda.set_device(local_rank)
+            self.device = torch.device(f"cuda:{local_rank}")
+        else:
+            self.device = torch.device(device)
+
         self.ae, self.dit, self.llm_encoder = load_models(
             dit_path=dit_path,
             ae_path=ae_path,
             qwen2vl_model_path=qwen2vl_model_path,
             max_length=max_length,
             dtype=dtype,
-            device=self.device
+            device=self.device,
+            mode=mode
         )
         if not quantized:
             self.dit = self.dit.to(dtype=torch.bfloat16)
@@ -150,6 +187,7 @@ class ImageGenerator:
             )
         else:
             self.lora_module = None
+        self.mode = mode
 
 
     def prepare(self, prompt, img, ref_image, ref_image_raw):
@@ -431,7 +469,8 @@ class ImageGenerator:
         x = x.mul(0.5).add(0.5)
 
         t1 = time.perf_counter()
-        print(f"Done in {t1 - t0:.1f}s.")
+        if os.getenv("TORCHELASTIC_RUN_ID") is None or dist.get_rank() == 0:
+            print(f"Done in {t1 - t0:.1f}s.")
         images_list = []
         for img in x.float():
             images_list.append(self.output_process_image(F.to_pil_image(img), img_info))
@@ -452,6 +491,12 @@ def main():
     parser.add_argument('--offload', action='store_true', help='Use offload for large models')
     parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights')
     parser.add_argument('--lora', type=str, default=None)
+    parser.add_argument('--ring_degree', type=int, default=1)
+    parser.add_argument('--ulysses_degree', type=int, default=1)
+    parser.add_argument('--cfg_degree', type=int, default=1)
+    parser.add_argument('--teacache', action='store_true')
+    parser.add_argument('--teacache_threshold', type=float, default=0.2, help='Used to control the acceleration ratio of teacache')
+    
     args = parser.parse_args()
 
     assert os.path.exists(args.input_dir), f"Input directory {args.input_dir} does not exist."
@@ -462,6 +507,8 @@ def main():
 
     image_and_prompts = json.load(open(args.json_path, 'r'))
 
+    mode = "flash" if args.ring_degree * args.ulysses_degree * args.cfg_degree == 1 else "xdit"
+
     image_edit = ImageGenerator(
         ae_path=os.path.join(args.model_path, 'vae.safetensors'),
         dit_path=os.path.join(args.model_path, "step1x-edit-i1258.safetensors"),
@@ -470,7 +517,20 @@ def main():
         quantized=args.quantized,
         offload=args.offload,
         lora=args.lora,
+        mode=mode
     )
+
+    if args.teacache: 
+        teacache_init(image_edit, args) 
+        if args.ring_degree * args.ulysses_degree * args.cfg_degree != 1:
+            cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
+            parallel_teacache_transformer(image_edit)
+        else:
+            teacache_transformer(image_edit)
+    else:
+        if args.ring_degree * args.ulysses_degree * args.cfg_degree != 1:
+            cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
+            parallel_transformer(image_edit)
 
     time_list = []
     for image_name, prompt in image_and_prompts.items():
@@ -490,13 +550,16 @@ def main():
             size_level=args.size_level,
         )[0]
         
-        print(f"Time taken: {time.time() - start_time:.2f} seconds")
-        time_list.append(time.time() - start_time)
+        if os.getenv("TORCHELASTIC_RUN_ID") is None or dist.get_rank() == 0:
+            print(f"Time taken: {time.time() - start_time:.2f} seconds")
+            time_list.append(time.time() - start_time)
 
-        image.save(
-            os.path.join(output_path), lossless=True
-        )
-    print(f'average time for {args.output_dir}: ', sum(time_list[1:]) / len(time_list[1:]))
+            image.save(
+                os.path.join(output_path), lossless=True
+            )
+
+    if os.getenv("TORCHELASTIC_RUN_ID") is None or dist.get_rank() == 0:
+        print(f'average time for {args.output_dir}: ', sum(time_list[1:]) / len(time_list[1:]))
 
 
 if __name__ == "__main__":
