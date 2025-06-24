@@ -14,7 +14,7 @@ Our evaluation process consists of the following steps:
      ```
 
 2. Generate and Organize Your Images
-   - Generate and Organize your generated images in the following directory structure:
+   - Generate and Organize your generated images in the following directory structure (as a reference, you could find the step1x-edit results in [here](https://huggingface.co/datasets/Shiyu95/gedit_results)):
      ```
      results/
      ├── {method_name}/
