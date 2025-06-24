@@ -7,7 +7,6 @@ Our evaluation process consists of the following steps:
      conda env create -f qwen25vl_environment.yml
      conda activate qwen25vl
      ```
-   - Set up your API keys in secret_t2.env for GPT4.1 access
    - Then download our dataset stepfun-ai/GEdit-Bench:
      ```python
      from datasets import load_dataset
@@ -15,13 +14,12 @@ Our evaluation process consists of the following steps:
      ```
 
 2. Generate and Organize Your Images
-   - Generate images following the example code in `generate_image_example.py`
-   - Organize your generated images in the following directory structure:
+   - Generate and Organize your generated images in the following directory structure:
      ```
      results/
-     ├── method_name/
+     ├── {method_name}/
      │   └── fullset/
-     │       └── edit_task/
+     │       └── {edit_task}/
      │           ├── cn/  # Chinese instructions
      │           │   ├── key1.png
      │           │   ├── key2.png
@@ -33,19 +31,19 @@ Our evaluation process consists of the following steps:
      ```
 
 3. Evaluate using GPT4.1/Qwen2.5VL-72B-Instruct-AWQ
-   - For GPT-4.1 evaluation:
+   - For GPT-4.1 evaluation, set up your API keys in secret_t2.env for GPT4.1 access, and run the following command:
      ```bash
-     python test_gedit_score.py --model_name your_method --save_path --backbone gpt4o
+     python run_gedit_score.py --model_name your_model --save_dir score_dir --backbone gpt4o --edited_images_dir your_edited_images_dir
      ```
    - For Qwen evaluation:
      ```bash
-     python test_gedit_score.py --model_name your_method --save_path --backbone qwen25vl
+     python run_gedit_score.py --model_name your_model --save_dir score_dir --backbone qwen25vl --edited_images_dir your_edited_images_dir
      ```
 
 4. Analyze your results and obtain scores across all dimensions
    - Run the analysis script to get scores for semantics, quality, and overall performance:
      ```bash
-     python calculate_statistics.py --model_name your_method --save_path /path/to/results --backbone gpt4o
+     python calculate_statistics.py --model_name your_model --save_path score_dir --backbone gpt4o --language all
      ```
    - This will output scores broken down by edit category and provide aggregate metrics
 
