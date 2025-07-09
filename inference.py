@@ -454,8 +454,8 @@ class ImageGenerator:
             raise ValueError(f"Unsupported image type: {type(image)}")
 
     def output_process_image(self, resize_img, image_size):
-        # res_image = resize_img.resize(image_size)
-        # return res_image
+        res_image = resize_img.resize(image_size)
+        return res_image
         return resize_img
     
     def input_process_image(self, img, img_size=512):
