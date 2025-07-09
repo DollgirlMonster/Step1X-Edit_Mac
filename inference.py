@@ -252,7 +252,7 @@ class ImageGenerator:
         }
 
 
-    def prepare_t2i(self, prompt, img):
+    def prepare_t2i(self, prompt, img, ref_image_raw):
         bs, _, h, w = img.shape
 
         if bs == 1 and not isinstance(prompt, str):
@@ -277,7 +277,7 @@ class ImageGenerator:
             prompt = [prompt]
         if self.offload:
             self.llm_encoder = self.llm_encoder.to(self.device)
-        txt, mask = self.llm_encoder(prompt)
+        txt, mask = self.llm_encoder(prompt, ref_image_raw)
         if self.offload:
             self.llm_encoder = self.llm_encoder.cpu()
             cudagc()
@@ -302,6 +302,61 @@ class ImageGenerator:
             torch.where(diff_norm < 1.0, torch.ones_like(diff_norm), diff_norm),
         )
         return result
+
+    def denoise_t2i(
+        self,
+        img: torch.Tensor,
+        img_ids: torch.Tensor,
+        llm_embedding: torch.Tensor,
+        txt_ids: torch.Tensor,
+        timesteps: list[float],
+        cfg_guidance: float = 4.5,
+        mask=None,
+        show_progress=False,
+        timesteps_truncate=0.93,
+    ):
+        if self.offload:
+            self.dit = self.dit.to(self.device)
+        if show_progress:
+            pbar = tqdm(itertools.pairwise(timesteps), desc='denoising...')
+        else:
+            pbar = itertools.pairwise(timesteps)
+        for idx, (t_curr, t_prev) in enumerate(pbar):
+            if img.shape[0] == 1 and cfg_guidance != -1:
+                img = torch.cat([img, img], dim=0)
+            t_vec = torch.full(
+                (img.shape[0],), t_curr, dtype=img.dtype, device=img.device
+            )
+            pred = self.dit(
+                img=img,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                timesteps=t_vec,
+                llm_embedding=llm_embedding,
+                t_vec=t_vec,
+                mask=mask,
+                idx=idx,
+            )
+            
+            if cfg_guidance != -1:
+                cond, uncond = (
+                    pred[0 : pred.shape[0] // 2, :],
+                    pred[pred.shape[0] // 2 :, :],
+                )
+                if t_curr > timesteps_truncate:
+                    diff = cond - uncond
+                    diff_norm = torch.norm(diff, dim=(2), keepdim=True)
+                    pred = uncond + cfg_guidance * (
+                        cond - uncond
+                    ) / self.process_diff_norm(diff_norm, k=0.4)
+                else:
+                    pred = uncond + cfg_guidance * (cond - uncond)
+            img = img[0 : img.shape[0] // 2] + (t_prev - t_curr) * pred
+        if self.offload:
+            self.dit = self.dit.cpu()
+            cudagc()
+
+        return img
 
     def denoise(
         self,
@@ -434,15 +489,19 @@ class ImageGenerator:
         image2image_strength=0.0,
         show_progress=False,
         size_level=512,
+        height=None,
+        width=None,
     ):
         assert num_samples == 1, "num_samples > 1 is not supported yet."
-        ref_images_raw, img_info = self.input_process_image(ref_images, img_size=size_level)
-        
         if ref_images == None:
             self.task_type='t2i'
+            ref_images = Image.new('RGB', (1024, 1024))
+            ref_images_raw = ref_images
+            img_info = (width, height) if width is not None and height is not None else (1024, 1024)
         else:
             self.task_type = 'edit'
-
+            ref_images_raw, img_info = self.input_process_image(ref_images, img_size=size_level)
+        
         if self.task_type == 'edit': 
             width, height = ref_images_raw.width, ref_images_raw.height
 
@@ -456,11 +515,11 @@ class ImageGenerator:
                 self.ae = self.ae.cpu()
                 cudagc()
         else:
-            ref_images_raw = None
-            img_info = None
-            width, height = size_level, size_level
+            width, height = img_info
+            ref_images_raw = self.load_image(ref_images_raw)
+            ref_images_raw = ref_images_raw.to(self.device)
             ref_images = None
-
+            
         seed = int(seed)
         seed = torch.Generator(device="cpu").seed() if seed < 0 else seed
 
@@ -500,20 +559,30 @@ class ImageGenerator:
         if self.task_type == 'edit':
             ref_images = torch.cat([ref_images, ref_images], dim=0)
             ref_images_raw = torch.cat([ref_images_raw, ref_images_raw], dim=0)
+            inputs = self.prepare([prompt, negative_prompt], x, ref_image=ref_images, ref_image_raw=ref_images_raw)
         else:
-            ref_images = None
-            ref_images_raw = None
+            ref_images_raw = torch.cat([ref_images_raw, ref_images_raw], dim=0)
+            inputs = self.prepare_t2i([prompt, negative_prompt], x, ref_images_raw)
 
-        inputs = self.prepare([prompt, negative_prompt], x, ref_image=ref_images, ref_image_raw=ref_images_raw)
+        
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            x = self.denoise(
-                **inputs,
-                cfg_guidance=cfg_guidance,
-                timesteps=timesteps,
-                show_progress=show_progress,
-                timesteps_truncate=0.93,
-            )
+            if self.task_type == 'edit':
+                x = self.denoise(
+                    **inputs,
+                    cfg_guidance=cfg_guidance,
+                    timesteps=timesteps,
+                    show_progress=show_progress,
+                    timesteps_truncate=0.93,
+                )
+            else:
+                x = self.denoise_t2i(
+                    **inputs,
+                    cfg_guidance=cfg_guidance,
+                    timesteps=timesteps,
+                    show_progress=show_progress,
+                    timesteps_truncate=0.93,
+                )
         x = self.unpack(x.float(), height, width)
         if self.offload:
             self.ae = self.ae.to(self.device)
@@ -553,7 +622,10 @@ def main():
     parser.add_argument('--cfg_degree', type=int, default=1)
     parser.add_argument('--teacache', action='store_true')
     parser.add_argument('--teacache_threshold', type=float, default=0.2, help='Used to control the acceleration ratio of teacache')
-    parser.add_argument('--version', type=str, default='v1.0', choices=['v1.0', 'v1.1'])
+    parser.add_argument('--version', type=str, default='v1.1', choices=['v1.0', 'v1.1'])
+    parser.add_argument('--task_type', type=str, default='edit', choices=['edit', 't2i'], help='Task type: edit or t2i')
+    parser.add_argument('--height', type=int, default=1024, help='Size of the output image (for t2i task)')
+    parser.add_argument('--width', type=int, default=1024, help='Size of the output image (for t2i task)')
     
     args = parser.parse_args()
 
@@ -604,14 +676,16 @@ def main():
 
         image = image_edit.generate_image(
             prompt,
-            negative_prompt="",
-            ref_images=Image.open(image_path).convert("RGB"),
+            negative_prompt="" if args.task_type == 'edit' else "worst quality, wrong limbs, unreasonable limbs, normal quality, low quality, low res, blurry, text, watermark, logo, banner, extra digits, cropped, jpeg artifacts, signature, username, error, sketch ,duplicate, ugly, monochrome, horror, geometry, mutation, disgusting",
+            ref_images=Image.open(image_path).convert("RGB") if args.task_type == 'edit' else None,
             num_samples=1,
             num_steps=args.num_steps,
             cfg_guidance=args.cfg_guidance,
             seed=args.seed,
             show_progress=True,
             size_level=args.size_level,
+            height=args.height,
+            width=args.width,
         )[0]
         
         if os.getenv("TORCHELASTIC_RUN_ID") is None or dist.get_rank() == 0:
