@@ -391,7 +391,6 @@ class ImageGenerator:
                 llm_embedding=llm_embedding,
                 t_vec=t_vec,
                 mask=mask,
-                idx = idx,
             )
             pred = pred[:, :pred.shape[1] // 2]
 

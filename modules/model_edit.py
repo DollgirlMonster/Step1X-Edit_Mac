@@ -207,7 +207,6 @@ class Step1XEdit(nn.Module):
         llm_embedding: Tensor,
         t_vec: Tensor,
         mask: Tensor,
-        idx = None,
     ) -> Tensor:
         txt, y = self.connector(
             llm_embedding, t_vec, mask
