@@ -36,7 +36,6 @@ def parallel_transformer(pipe):
         llm_embedding: Tensor,
         t_vec: Tensor,
         mask: Tensor,
-        idx = None,
     ):  
         txt, y = self.connector(
             llm_embedding, t_vec, mask
