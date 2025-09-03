@@ -15,7 +15,7 @@
 
 
 ## 🔥🔥🔥 News!!
-* Jul 09, 2025: 👋 We’ve updated the step1x-edit model and released it as [step1x-edit-v1p1](https://huggingface.co/stepfun-ai/Step1X-Edit), featuring:
+* Jul 09, 2025: 👋 We’ve updated the step1x-edit model and released it as [step1x-edit-v1p1](https://huggingface.co/stepfun-ai/Step1X-Edit) (diffusers version see [here](https://huggingface.co/stepfun-ai/Step1X-Edit-v1p1-diffusers)), featuring:
   - Added support for text-to-image (T2I) generation tasks
   - Improved image editing quality and better instruction-following performance.
   Quantitative evaluation on GEdit-Bench-EN (Full set). G_SC, G_PQ, and G_O refer to the metrics evaluated by GPT-4.1, while Q_SC, Q_PQ, and Q_O refer to the metrics evaluated by Qwen2.5-VL-72B. To facilitate reproducibility, we have released the [intermediate results](https://huggingface.co/datasets/Shiyu95/gedit_results) of our model evaluations.
