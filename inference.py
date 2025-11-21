@@ -29,6 +29,28 @@ from xfuser.core.distributed import (
     initialize_model_parallel,
 )
 
+# Import device utilities for cross-platform support
+try:
+    from library.device_utils import clean_memory_on_device, get_preferred_device, HAS_MPS, HAS_CUDA
+except ImportError:
+    # Fallback if library is not available
+    HAS_MPS = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+    HAS_CUDA = torch.cuda.is_available()
+    def clean_memory_on_device(device):
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps" and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+    def get_preferred_device():
+        if HAS_CUDA:
+            return torch.device("cuda")
+        elif HAS_MPS:
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+
 def cfg_usp_level_setting(ring_degree: int = 1, ulysses_degree: int = 1, cfg_degree: int = 1):
     # restriction: dist.get_world_size() == <cfg_degree> x <ring_degree> x <ulysses_degree>
     initialize_model_parallel(
@@ -48,8 +70,12 @@ def teacache_init(pipe, args):
 
 
 def cudagc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    """Memory cleanup for CUDA/MPS devices"""
+    if HAS_CUDA:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    elif HAS_MPS and hasattr(torch.mps, 'empty_cache'):
+        torch.mps.empty_cache()
 
 def load_state_dict(model, ckpt_path, device="cuda", strict=False, assign=True):
     if Path(ckpt_path).suffix == ".safetensors":
@@ -81,6 +107,23 @@ def load_models(
     dtype=torch.bfloat16,
     version='v1.0'
 ):
+    # Auto-detect device if using default
+    if device == "cuda" and not HAS_CUDA and HAS_MPS:
+        device = "mps"
+        print(f"CUDA not available, using MPS device instead")
+    
+    # Determine attention mode based on device and flash-attn availability
+    if mode == "flash":
+        try:
+            import flash_attn
+            if device == "mps":
+                # Flash attention not supported on MPS, fall back to torch
+                mode = "torch"
+                print(f"Flash attention not supported on MPS, using 'torch' mode")
+        except ImportError:
+            mode = "torch"
+            print(f"Flash attention not available, using 'torch' mode")
+    
     qwen2vl_encoder = Qwen2VLEmbedder(
         qwen2vl_model_path,
         device=device,
@@ -161,6 +204,14 @@ class ImageGenerator:
             torch.cuda.set_device(local_rank)
             self.device = torch.device(f"cuda:{local_rank}")
         else:
+            # Auto-detect device if using default "cuda"
+            if device == "cuda" and not HAS_CUDA:
+                if HAS_MPS:
+                    device = "mps"
+                    print(f"CUDA not available, using MPS device")
+                else:
+                    device = "cpu"
+                    print(f"No GPU available, using CPU")
             self.device = torch.device(device)
 
         self.ae, self.dit, self.llm_encoder = load_models(
@@ -174,10 +225,15 @@ class ImageGenerator:
             version=version,
         )
         
+        # Handle quantization - MPS may have limited fp8 support
         if not quantized:
             self.dit = self.dit.to(dtype=torch.bfloat16)
         else:
-            self.dit = self.dit.to(dtype=torch.float8_e4m3fn)
+            if self.device.type == "mps":
+                print("Warning: FP8 quantization on MPS may have limited support. Using bfloat16 instead.")
+                self.dit = self.dit.to(dtype=torch.bfloat16)
+            else:
+                self.dit = self.dit.to(dtype=torch.float8_e4m3fn)
         if not offload:
             self.dit = self.dit.to(device=self.device)
             self.ae = self.ae.to(device=self.device)
@@ -612,8 +668,10 @@ def main():
     parser.add_argument('--num_steps', type=int, default=28, help='Number of diffusion steps')
     parser.add_argument('--cfg_guidance', type=float, default=6.0, help='CFG guidance strength')
     parser.add_argument('--size_level', default=512, type=int)
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], 
+                        help='Device to use (auto will detect best available)')
     parser.add_argument('--offload', action='store_true', help='Use offload for large models')
-    parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights')
+    parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights (Note: MPS uses bfloat16 instead)')
     parser.add_argument('--lora', type=str, default=None)
     parser.add_argument('--ring_degree', type=int, default=1)
     parser.add_argument('--ulysses_degree', type=int, default=1)
@@ -629,6 +687,23 @@ def main():
 
     assert os.path.exists(args.input_dir), f"Input directory {args.input_dir} does not exist."
     assert os.path.exists(args.json_path), f"JSON file {args.json_path} does not exist."
+
+    # Determine device
+    if args.device == 'auto':
+        if HAS_CUDA:
+            device = 'cuda'
+        elif HAS_MPS:
+            device = 'mps'
+        else:
+            device = 'cpu'
+        print(f"Auto-detected device: {device}")
+    else:
+        device = args.device
+        # Validate device availability
+        if device == 'cuda' and not HAS_CUDA:
+            raise ValueError("CUDA is not available on this system")
+        elif device == 'mps' and not HAS_MPS:
+            raise ValueError("MPS is not available on this system")
 
     args.output_dir = args.output_dir.rstrip('/') + ('-offload' if args.offload else "") + ('-quantized' if args.quantized else "") + f"-{args.size_level}"
     os.makedirs(args.output_dir, exist_ok=True)
@@ -647,6 +722,7 @@ def main():
         dit_path=os.path.join(args.model_path, ckpt_name),
         qwen2vl_model_path=os.path.join(args.model_path, 'Qwen2.5-VL-7B-Instruct'),
         max_length=640,
+        device=device,
         quantized=args.quantized,
         offload=args.offload,
         lora=args.lora,
