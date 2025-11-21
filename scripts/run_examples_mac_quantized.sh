@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e  # Exit immediately if any command fails
+
 # Script for running Step1X-Edit on M-Series Macs with quantization
 # Note: On MPS, quantization uses bfloat16 instead of fp8 for compatibility
 

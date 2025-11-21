@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e  # Exit immediately if any command fails
+
 # Script for running Step1X-Edit on M-Series Macs (M1/M2/M3)
 # This script uses MPS (Metal Performance Shaders) for GPU acceleration
 

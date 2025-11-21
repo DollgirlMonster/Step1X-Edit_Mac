@@ -24,6 +24,8 @@ from modules.conditioner import Qwen25VL_7b_Embedder as Qwen2VLEmbedder
 from modules.model_edit import Step1XParams, Step1XEdit
 
 # Import device utilities for cross-platform support
+# Note: Functions are duplicated across inference.py and gradio_app.py as fallback
+# in case library.device_utils is not available (e.g., minimal installations)
 try:
     from library.device_utils import clean_memory_on_device, get_preferred_device, HAS_MPS, HAS_CUDA
 except ImportError:
@@ -146,6 +148,7 @@ def load_models(
     dtype=torch.bfloat16,
 ):
     # Resolve device and attention mode
+    # Note: Default "cuda" is treated as "auto" for backward compatibility while enabling auto-detection
     device = resolve_device(device if device != "cuda" else "auto")
     mode = get_attention_mode("flash", device)
     
@@ -221,6 +224,7 @@ class ImageGenerator:
         lora=None,
     ) -> None:
         # Resolve device using helper function
+        # Note: Default "cuda" is treated as "auto" for backward compatibility
         device = resolve_device(device if device != "cuda" else "auto")
         self.device = torch.device(device)
         
