@@ -15,6 +15,7 @@
 
 
 ## 🔥🔥🔥 News!!
+* **NEW:** 🍎 Step1X-Edit now supports M-Series Macs (M1/M2/M3)! See [MacOS Setup Guide](MACOS_SETUP.md) for detailed instructions.
 * Sep 08, 2025: 👋 We release [step1x-edit-v1p2-preview](https://huggingface.co/stepfun-ai/Step1X-Edit-v1p2-preview), a new version of Step1X-Edit with reasoning edit ability and better performance (report to be released soon), featuring:
   - Native Reasoning Edit Model: Combines instruction reasoning with reflective correction to handle complex edits more accurately. Performance on KRIS-Bench:
     |    Models    |   Factual Knowledge ⬆️   |  Conceptual Knowledge ⬆️ | Procedural Knowledge ⬆️   |  Overall ⬆️ | 
@@ -71,6 +72,7 @@ If you develop/use Step1X-Edit in your projects, welcome to let us know 🎉.
 - [x] FP8 Quantified weight
 - [x] ComfyUI
 - [x] Diffusers
+- [x] M-Series MacOS Support (MPS acceleration)
 
 
 
