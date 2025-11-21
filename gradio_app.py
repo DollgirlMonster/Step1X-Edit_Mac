@@ -23,11 +23,101 @@ from modules.autoencoder import AutoEncoder
 from modules.conditioner import Qwen25VL_7b_Embedder as Qwen2VLEmbedder
 from modules.model_edit import Step1XParams, Step1XEdit
 
+# Import device utilities for cross-platform support
+# Note: Functions are duplicated across inference.py and gradio_app.py as fallback
+# in case library.device_utils is not available (e.g., minimal installations)
+try:
+    from library.device_utils import clean_memory_on_device, get_preferred_device, HAS_MPS, HAS_CUDA
+except ImportError:
+    # Fallback if library is not available
+    HAS_MPS = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+    HAS_CUDA = torch.cuda.is_available()
+    def clean_memory_on_device(device):
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps" and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+    def get_preferred_device():
+        if HAS_CUDA:
+            return torch.device("cuda")
+        elif HAS_MPS:
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+
+def resolve_device(device_str: str) -> str:
+    """
+    Resolve device string to actual available device.
+    
+    Args:
+        device_str: One of 'auto', 'cuda', 'mps', 'cpu'
+    
+    Returns:
+        Resolved device string
+    
+    Raises:
+        ValueError: If requested device is not available
+    """
+    if device_str == 'auto':
+        if HAS_CUDA:
+            return 'cuda'
+        elif HAS_MPS:
+            return 'mps'
+        else:
+            return 'cpu'
+    elif device_str == 'cuda':
+        if not HAS_CUDA:
+            if HAS_MPS:
+                print("Warning: CUDA requested but not available. Using MPS instead.")
+                return 'mps'
+            else:
+                raise ValueError("CUDA is not available on this system")
+        return 'cuda'
+    elif device_str == 'mps':
+        if not HAS_MPS:
+            raise ValueError("MPS is not available on this system")
+        return 'mps'
+    elif device_str == 'cpu':
+        return 'cpu'
+    else:
+        raise ValueError(f"Unknown device: {device_str}")
+
+def get_attention_mode(mode: str, device: str) -> str:
+    """
+    Determine appropriate attention mode based on device and flash-attn availability.
+    
+    Args:
+        mode: Requested attention mode ('flash', 'torch', 'vanilla', 'xdit')
+        device: Target device ('cuda', 'mps', 'cpu')
+    
+    Returns:
+        Appropriate attention mode
+    """
+    if mode != "flash":
+        return mode
+    
+    try:
+        import flash_attn
+        if device == "mps":
+            print("Flash attention not supported on MPS, using 'torch' mode")
+            return "torch"
+        return "flash"
+    except ImportError:
+        print("Flash attention not available, using 'torch' mode")
+        return "torch"
+
 print("TORCH_CUDA", torch.cuda.is_available())
+print("TORCH_MPS", HAS_MPS)
 
 def cudagc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    """Memory cleanup for CUDA/MPS devices"""
+    if HAS_CUDA:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    elif HAS_MPS and hasattr(torch.mps, 'empty_cache'):
+        torch.mps.empty_cache()
 
 def load_state_dict(model, ckpt_path, device="cuda", strict=False, assign=True):
     if Path(ckpt_path).suffix == ".safetensors":
@@ -57,6 +147,11 @@ def load_models(
     max_length=256,
     dtype=torch.bfloat16,
 ):
+    # Resolve device and attention mode
+    # Note: Default "cuda" is treated as "auto" for backward compatibility while enabling auto-detection
+    device = resolve_device(device if device != "cuda" else "auto")
+    mode = get_attention_mode("flash", device)
+    
     qwen2vl_encoder = Qwen2VLEmbedder(
         qwen2vl_model_path,
         device=device,
@@ -90,6 +185,7 @@ def load_models(
             axes_dim=[16, 56, 56],
             theta=10_000,
             qkv_bias=True,
+            mode=mode,
         )
         dit = Step1XEdit(step1x_params)
 
@@ -127,7 +223,11 @@ class ImageGenerator:
         offload=False,
         lora=None,
     ) -> None:
+        # Resolve device using helper function
+        # Note: Default "cuda" is treated as "auto" for backward compatibility
+        device = resolve_device(device if device != "cuda" else "auto")
         self.device = torch.device(device)
+        
         self.ae, self.dit, self.llm_encoder = load_models(
             dit_path=dit_path,
             ae_path=ae_path,
@@ -136,10 +236,16 @@ class ImageGenerator:
             dtype=dtype,
             device=self.device
         )
+        
+        # Handle quantization - MPS may have limited fp8 support
         if not quantized:
             self.dit = self.dit.to(dtype=torch.bfloat16)
         else:
-            self.dit = self.dit.to(dtype=torch.float8_e4m3fn)
+            if self.device.type == "mps":
+                print("Warning: FP8 quantization on MPS may have limited support. Using bfloat16 instead.")
+                self.dit = self.dit.to(dtype=torch.bfloat16)
+            else:
+                self.dit = self.dit.to(dtype=torch.float8_e4m3fn)
         if not offload:
             self.dit = self.dit.to(device=self.device)
             self.ae = self.ae.to(device=self.device)
@@ -447,11 +553,20 @@ def prepare_infer_func(args):
     # 本地保存路径
     model_path = args.model_path
 
+    # Determine device using helper function
+    try:
+        device = resolve_device(args.device)
+        print(f"Using device: {device}")
+    except ValueError as e:
+        print(f"Error: {e}")
+        raise
+
     image_edit = ImageGenerator(
         ae_path=os.path.join(model_path, 'vae.safetensors'),
         dit_path=os.path.join(args.model_path, "step1x-edit-i1258-FP8.safetensors" if args.quantized else "step1x-edit-i1258.safetensors"),
         qwen2vl_model_path='Qwen/Qwen2.5-VL-7B-Instruct',
         max_length=640,
+        device=device,
         quantized=args.quantized,
         offload=args.offload,
     )
@@ -527,8 +642,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True, help='Path to the model checkpoint')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], 
+                        help='Device to use (auto will detect best available)')
     parser.add_argument('--offload', action='store_true', help='Use offload for large models')
-    parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights')
+    parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights (Note: MPS uses bfloat16 instead)')
     parser.add_argument('--lora', type=str, default=None, help='Path to the lora weights')
     args = parser.parse_args()
 

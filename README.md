@@ -15,6 +15,7 @@
 
 
 ## 🔥🔥🔥 News!!
+* **NEW:** 🍎 Step1X-Edit now supports M-Series Macs (M1/M2/M3)! See [MacOS Setup Guide](MACOS_SETUP.md) for detailed instructions.
 * Sep 08, 2025: 👋 We release [step1x-edit-v1p2-preview](https://huggingface.co/stepfun-ai/Step1X-Edit-v1p2-preview), a new version of Step1X-Edit with reasoning edit ability and better performance (report to be released soon), featuring:
   - Native Reasoning Edit Model: Combines instruction reasoning with reflective correction to handle complex edits more accurately. Performance on KRIS-Bench:
     |    Models    |   Factual Knowledge ⬆️   |  Conceptual Knowledge ⬆️ | Procedural Knowledge ⬆️   |  Overall ⬆️ | 
@@ -71,6 +72,7 @@ If you develop/use Step1X-Edit in your projects, welcome to let us know 🎉.
 - [x] FP8 Quantified weight
 - [x] ComfyUI
 - [x] Diffusers
+- [x] M-Series MacOS Support (MPS acceleration)
 
 
 
@@ -113,6 +115,7 @@ The table below presents the speedup of several efficient methods on the Step1X-
 
 ### 2.2 Dependencies and Installation
 
+#### For CUDA/Linux Systems
 
 python >=3.10.0 and install [torch](https://pytorch.org/get-started/locally/) >= 2.2 with cuda toolkit and corresponding torchvision. We test our model using torch==2.3.1 and torch==2.5.1 with cuda-12.1.
 
@@ -133,8 +136,29 @@ The script will generate a wheel name like `flash_attn-2.7.2.post1+cu12torch2.5c
 
 Then you can download the corresponding pre-built wheel and install it following the instructions in [`flash-attn`](https://github.com/Dao-AILab/flash-attention).
 
+#### For M-Series MacOS (M1/M2/M3)
+
+python >=3.10.0 and install [torch](https://pytorch.org/get-started/locally/) >= 2.2 with MPS support. We recommend using torch==2.3.1 or later.
+
+Install requirements:
+  
+``` bash
+pip install -r requirements.txt
+```
+
+**Note:** `flash-attn` is not available on MacOS. The model will automatically use PyTorch's native attention implementation (`torch` mode) instead, which provides good performance on M-Series chips with MPS acceleration.
+
+**Important for MacOS users:**
+- The model will automatically detect and use the MPS (Metal Performance Shaders) backend for GPU acceleration on M-Series Macs
+- When using `--quantized` flag on MPS, the model uses `bfloat16` instead of `fp8` for compatibility
+- For best results on MacOS, we recommend using `--offload` flag to manage memory efficiently
+- The `--device` argument supports: `auto` (default, auto-detects), `mps` (M-Series GPU), `cpu`
+
 
 ### 2.3 Inference Scripts
+
+#### For CUDA/Linux Systems
+
 After downloading the [model weights](https://huggingface.co/stepfun-ai/Step1X-Edit), you can use the following scripts to edit images:
 
 ```
@@ -159,12 +183,61 @@ This default script runs the inference code on example inputs. The results will 
 <img width="1080" alt="results" src="assets/efficient_teasar.png">
 </div>
 
+#### For M-Series MacOS
+
+After downloading the [model weights](https://huggingface.co/stepfun-ai/Step1X-Edit), you can use the following scripts to edit images on M-Series Macs:
+
+**Basic usage (standard quality):**
+```bash
+bash scripts/run_examples_mac.sh
+```
+
+**With quantization and memory optimization:**
+```bash
+bash scripts/run_examples_mac_quantized.sh
+```
+
+**Manual usage with custom settings:**
+```bash
+python inference.py --input_dir ./examples \
+    --model_path /path/to/step1x-edit/ \
+    --json_path ./examples/prompt_en.json \
+    --output_dir ./output_mac \
+    --device mps \
+    --quantized \
+    --offload \
+    --seed 1234 --size_level 512 --version v1.1
+```
+
+**Device options:**
+- `--device auto`: Automatically detect best available device (recommended)
+- `--device mps`: Force use of M-Series GPU
+- `--device cpu`: Use CPU only (not recommended for performance)
+
+**Memory optimization for MacOS:**
+- Use `--offload` to reduce GPU memory usage
+- Use `--quantized` for lower memory footprint (uses bfloat16 on MPS)
+- Start with `--size_level 512` and increase if you have enough memory
+- For Macs with 16GB unified memory, use `--offload --quantized --size_level 512`
+- For Macs with 32GB+ unified memory, you can try `--size_level 1024`
+
 ### 2.4 Gradio Scripts
 
-Change the `model_path` in `gradio_app.py` to the local path of Step1X-Edit. Then run
+Change the `model_path` in `gradio_app.py` to the local path of Step1X-Edit. Then run:
 
+**For CUDA/Linux:**
 ```bash
-python gradio_app.py
+python gradio_app.py --model_path /path/to/step1x-edit/
+```
+
+**For M-Series MacOS:**
+```bash
+python gradio_app.py --model_path /path/to/step1x-edit/ --device mps --offload
+```
+
+**With quantization (MacOS):**
+```bash
+python gradio_app.py --model_path /path/to/step1x-edit/ --device mps --quantized --offload
 ```
 
 Then the gradio demo will run on `localhost:32800`.

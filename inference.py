@@ -20,17 +20,120 @@ import sampling
 from modules.autoencoder import AutoEncoder
 from modules.conditioner import Qwen25VL_7b_Embedder as Qwen2VLEmbedder
 from modules.model_edit import Step1XParams, Step1XEdit
-from modules.multigpu import parallel_transformer, teacache_transformer, parallel_teacache_transformer
+
+try:
+    from modules.multigpu import parallel_transformer, teacache_transformer, parallel_teacache_transformer
+    from xfuser.core.distributed import (
+        get_world_group,
+        initialize_model_parallel,
+    )
+    XFUSER_AVAILABLE = True
+except (ImportError, AssertionError):
+    # xfuser not available or CUDA not available (macOS)
+    parallel_transformer = None
+    teacache_transformer = None
+    parallel_teacache_transformer = None
+    get_world_group = None
+    initialize_model_parallel = None
+    XFUSER_AVAILABLE = False
 
 from torch import Tensor
 import torch.distributed as dist
-from xfuser.core.distributed import (
-    get_world_group,
-    initialize_model_parallel,
-)
+
+# Import device utilities for cross-platform support
+# Note: Functions are duplicated across inference.py and gradio_app.py as fallback
+# in case library.device_utils is not available (e.g., minimal installations)
+try:
+    from library.device_utils import clean_memory_on_device, get_preferred_device, HAS_MPS, HAS_CUDA
+except ImportError:
+    # Fallback if library is not available
+    HAS_MPS = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+    HAS_CUDA = torch.cuda.is_available()
+    def clean_memory_on_device(device):
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "mps" and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+    def get_preferred_device():
+        if HAS_CUDA:
+            return torch.device("cuda")
+        elif HAS_MPS:
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+
+def resolve_device(device_str) -> str:
+    """
+    Resolve the device string to an actual device (cuda, mps, or cpu).
+    
+    Args:
+        device_str: One of 'auto', 'cuda', 'mps', 'cpu', or a torch.device object
+    
+    Returns:
+        Resolved device string
+    
+    Raises:
+        ValueError: If requested device is not available
+    """
+    # Convert torch.device to string if necessary
+    if isinstance(device_str, torch.device):
+        device_str = device_str.type
+    
+    if device_str == 'auto':
+        if HAS_CUDA:
+            return 'cuda'
+        elif HAS_MPS:
+            return 'mps'
+        else:
+            return 'cpu'
+    elif device_str == 'cuda':
+        if not HAS_CUDA:
+            if HAS_MPS:
+                print("Warning: CUDA requested but not available. Using MPS instead.")
+                return 'mps'
+            else:
+                raise ValueError("CUDA is not available on this system")
+        return 'cuda'
+    elif device_str == 'mps':
+        if not HAS_MPS:
+            raise ValueError("MPS is not available on this system")
+        return 'mps'
+    elif device_str == 'cpu':
+        return 'cpu'
+    else:
+        raise ValueError(f"Unknown device: {device_str}")
+
+def get_attention_mode(mode: str, device: str) -> str:
+    """
+    Determine appropriate attention mode based on device and flash-attn availability.
+    
+    Args:
+        mode: Requested attention mode ('flash', 'torch', 'vanilla', 'xdit')
+        device: Target device ('cuda', 'mps', 'cpu')
+    
+    Returns:
+        Appropriate attention mode
+    """
+    if mode != "flash":
+        return mode
+    
+    try:
+        import flash_attn
+        if device == "mps":
+            print("Flash attention not supported on MPS, using 'torch' mode")
+            return "torch"
+        return "flash"
+    except ImportError:
+        print("Flash attention not available, using 'torch' mode")
+        return "torch"
 
 def cfg_usp_level_setting(ring_degree: int = 1, ulysses_degree: int = 1, cfg_degree: int = 1):
     # restriction: dist.get_world_size() == <cfg_degree> x <ring_degree> x <ulysses_degree>
+    if not XFUSER_AVAILABLE:
+        print("Warning: xfuser not available. Parallel processing disabled.")
+        return
     initialize_model_parallel(
         ring_degree=ring_degree,
         ulysses_degree=ulysses_degree,
@@ -48,8 +151,12 @@ def teacache_init(pipe, args):
 
 
 def cudagc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    """Memory cleanup for CUDA/MPS devices"""
+    if HAS_CUDA:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    elif HAS_MPS and hasattr(torch.mps, 'empty_cache'):
+        torch.mps.empty_cache()
 
 def load_state_dict(model, ckpt_path, device="cuda", strict=False, assign=True):
     if Path(ckpt_path).suffix == ".safetensors":
@@ -81,6 +188,11 @@ def load_models(
     dtype=torch.bfloat16,
     version='v1.0'
 ):
+    # Resolve device and attention mode
+    # Note: Default "cuda" is treated as "auto" for backward compatibility while enabling auto-detection
+    device = resolve_device(device if device != "cuda" else "auto")
+    mode = get_attention_mode(mode, device)
+    
     qwen2vl_encoder = Qwen2VLEmbedder(
         qwen2vl_model_path,
         device=device,
@@ -161,6 +273,9 @@ class ImageGenerator:
             torch.cuda.set_device(local_rank)
             self.device = torch.device(f"cuda:{local_rank}")
         else:
+            # Resolve device using helper function
+            # Note: Default "cuda" is treated as "auto" for backward compatibility
+            device = resolve_device(device if device != "cuda" else "auto")
             self.device = torch.device(device)
 
         self.ae, self.dit, self.llm_encoder = load_models(
@@ -174,10 +289,15 @@ class ImageGenerator:
             version=version,
         )
         
+        # Handle quantization - MPS may have limited fp8 support
         if not quantized:
             self.dit = self.dit.to(dtype=torch.bfloat16)
         else:
-            self.dit = self.dit.to(dtype=torch.float8_e4m3fn)
+            if self.device.type == "mps":
+                print("Warning: FP8 quantization on MPS may have limited support. Using bfloat16 instead.")
+                self.dit = self.dit.to(dtype=torch.bfloat16)
+            else:
+                self.dit = self.dit.to(dtype=torch.float8_e4m3fn)
         if not offload:
             self.dit = self.dit.to(device=self.device)
             self.ae = self.ae.to(device=self.device)
@@ -507,7 +627,9 @@ class ImageGenerator:
             ref_images_raw = ref_images_raw.to(self.device)
             if self.offload:
                 self.ae = self.ae.to(self.device)
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # Use device-agnostic autocast
+            device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+            with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16):
                 ref_images = self.ae.encode(ref_images_raw.to(self.device) * 2 - 1)
             if self.offload:
                 self.ae = self.ae.cpu()
@@ -612,8 +734,10 @@ def main():
     parser.add_argument('--num_steps', type=int, default=28, help='Number of diffusion steps')
     parser.add_argument('--cfg_guidance', type=float, default=6.0, help='CFG guidance strength')
     parser.add_argument('--size_level', default=512, type=int)
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'mps', 'cpu'], 
+                        help='Device to use (auto will detect best available)')
     parser.add_argument('--offload', action='store_true', help='Use offload for large models')
-    parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights')
+    parser.add_argument('--quantized', action='store_true', help='Use fp8 model weights (Note: MPS uses bfloat16 instead)')
     parser.add_argument('--lora', type=str, default=None)
     parser.add_argument('--ring_degree', type=int, default=1)
     parser.add_argument('--ulysses_degree', type=int, default=1)
@@ -629,6 +753,15 @@ def main():
 
     assert os.path.exists(args.input_dir), f"Input directory {args.input_dir} does not exist."
     assert os.path.exists(args.json_path), f"JSON file {args.json_path} does not exist."
+
+    # Determine device using helper function
+    try:
+        device = resolve_device(args.device)
+        print(f"Using device: {device}")
+    except ValueError as e:
+        import sys
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     args.output_dir = args.output_dir.rstrip('/') + ('-offload' if args.offload else "") + ('-quantized' if args.quantized else "") + f"-{args.size_level}"
     os.makedirs(args.output_dir, exist_ok=True)
@@ -647,6 +780,7 @@ def main():
         dit_path=os.path.join(args.model_path, ckpt_name),
         qwen2vl_model_path=os.path.join(args.model_path, 'Qwen2.5-VL-7B-Instruct'),
         max_length=640,
+        device=device,
         quantized=args.quantized,
         offload=args.offload,
         lora=args.lora,
@@ -657,14 +791,22 @@ def main():
     if args.teacache: 
         teacache_init(image_edit, args) 
         if args.ring_degree * args.ulysses_degree * args.cfg_degree != 1:
-            cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
-            parallel_teacache_transformer(image_edit)
+            if XFUSER_AVAILABLE:
+                cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
+                parallel_teacache_transformer(image_edit)
+            else:
+                print("Warning: Parallel processing requested but xfuser not available. Running in single-device mode.")
+                teacache_transformer(image_edit) if teacache_transformer else None
         else:
-            teacache_transformer(image_edit)
+            if teacache_transformer:
+                teacache_transformer(image_edit)
     else:
         if args.ring_degree * args.ulysses_degree * args.cfg_degree != 1:
-            cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
-            parallel_transformer(image_edit)
+            if XFUSER_AVAILABLE:
+                cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
+                parallel_transformer(image_edit)
+            else:
+                print("Warning: Parallel processing requested but xfuser not available. Running in single-device mode.")
 
     time_list = []
     for image_name, prompt in image_and_prompts.items():

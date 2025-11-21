@@ -24,9 +24,15 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from liger_kernel.ops.rms_norm import LigerRMSNormFunction
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
+
+try:
+    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+    LIGER_AVAILABLE = True
+except ImportError:
+    LigerRMSNormFunction = None
+    LIGER_AVAILABLE = False
 
 try:
     import flash_attn
@@ -385,7 +391,8 @@ class MLPEmbedder(nn.Module):
 
 def rope(pos, dim: int, theta: int):
     assert dim % 2 == 0
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    # Use float32 instead of float64 for MPS compatibility
+    scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     out = torch.einsum("...n,d->...nd", pos, omega)
     out = torch.stack(
@@ -472,14 +479,18 @@ class RMSNorm(torch.nn.Module):
 
     @staticmethod
     def rms_norm_fast(x, weight, eps):
-        return LigerRMSNormFunction.apply(
-            x,
-            weight,
-            eps,
-            0.0,
-            "gemma",
-            True,
-        )
+        if LIGER_AVAILABLE:
+            return LigerRMSNormFunction.apply(
+                x,
+                weight,
+                eps,
+                0.0,
+                "gemma",
+                True,
+            )
+        else:
+            # Fallback to standard RMS norm for macOS/systems without liger_kernel
+            return RMSNorm.rms_norm(x, weight, eps)
 
     @staticmethod
     def rms_norm(x, weight, eps):

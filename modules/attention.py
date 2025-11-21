@@ -2,7 +2,13 @@ import math
 
 import torch
 import torch.nn.functional as F
-from xfuser.model_executor.layers.usp import USP
+
+try:
+    from xfuser.model_executor.layers.usp import USP
+    XFUSER_AVAILABLE = True
+except (ImportError, AssertionError):
+    USP = None
+    XFUSER_AVAILABLE = False
 
 try:
     import flash_attn
@@ -126,6 +132,8 @@ def attention(
         # 计算输出
         x = attn @ v  # [B,A,S,D]
     elif mode == "xdit":
+        if not XFUSER_AVAILABLE or USP is None:
+            raise RuntimeError("xdit mode requires xfuser to be installed (not available on macOS)")
         x: torch.Tensor = USP(q, k, v, dropout_p=drop_rate, is_causal=causal)
     else:
         raise NotImplementedError(f"不支持的注意力模式: {mode}")
