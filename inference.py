@@ -20,14 +20,25 @@ import sampling
 from modules.autoencoder import AutoEncoder
 from modules.conditioner import Qwen25VL_7b_Embedder as Qwen2VLEmbedder
 from modules.model_edit import Step1XParams, Step1XEdit
-from modules.multigpu import parallel_transformer, teacache_transformer, parallel_teacache_transformer
+
+try:
+    from modules.multigpu import parallel_transformer, teacache_transformer, parallel_teacache_transformer
+    from xfuser.core.distributed import (
+        get_world_group,
+        initialize_model_parallel,
+    )
+    XFUSER_AVAILABLE = True
+except (ImportError, AssertionError):
+    # xfuser not available or CUDA not available (macOS)
+    parallel_transformer = None
+    teacache_transformer = None
+    parallel_teacache_transformer = None
+    get_world_group = None
+    initialize_model_parallel = None
+    XFUSER_AVAILABLE = False
 
 from torch import Tensor
 import torch.distributed as dist
-from xfuser.core.distributed import (
-    get_world_group,
-    initialize_model_parallel,
-)
 
 # Import device utilities for cross-platform support
 # Note: Functions are duplicated across inference.py and gradio_app.py as fallback
@@ -53,12 +64,12 @@ except ImportError:
         else:
             return torch.device("cpu")
 
-def resolve_device(device_str: str) -> str:
+def resolve_device(device_str) -> str:
     """
-    Resolve device string to actual available device.
+    Resolve the device string to an actual device (cuda, mps, or cpu).
     
     Args:
-        device_str: One of 'auto', 'cuda', 'mps', 'cpu'
+        device_str: One of 'auto', 'cuda', 'mps', 'cpu', or a torch.device object
     
     Returns:
         Resolved device string
@@ -66,6 +77,10 @@ def resolve_device(device_str: str) -> str:
     Raises:
         ValueError: If requested device is not available
     """
+    # Convert torch.device to string if necessary
+    if isinstance(device_str, torch.device):
+        device_str = device_str.type
+    
     if device_str == 'auto':
         if HAS_CUDA:
             return 'cuda'
@@ -116,6 +131,9 @@ def get_attention_mode(mode: str, device: str) -> str:
 
 def cfg_usp_level_setting(ring_degree: int = 1, ulysses_degree: int = 1, cfg_degree: int = 1):
     # restriction: dist.get_world_size() == <cfg_degree> x <ring_degree> x <ulysses_degree>
+    if not XFUSER_AVAILABLE:
+        print("Warning: xfuser not available. Parallel processing disabled.")
+        return
     initialize_model_parallel(
         ring_degree=ring_degree,
         ulysses_degree=ulysses_degree,
@@ -609,7 +627,9 @@ class ImageGenerator:
             ref_images_raw = ref_images_raw.to(self.device)
             if self.offload:
                 self.ae = self.ae.to(self.device)
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # Use device-agnostic autocast
+            device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+            with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16):
                 ref_images = self.ae.encode(ref_images_raw.to(self.device) * 2 - 1)
             if self.offload:
                 self.ae = self.ae.cpu()
@@ -771,14 +791,22 @@ def main():
     if args.teacache: 
         teacache_init(image_edit, args) 
         if args.ring_degree * args.ulysses_degree * args.cfg_degree != 1:
-            cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
-            parallel_teacache_transformer(image_edit)
+            if XFUSER_AVAILABLE:
+                cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
+                parallel_teacache_transformer(image_edit)
+            else:
+                print("Warning: Parallel processing requested but xfuser not available. Running in single-device mode.")
+                teacache_transformer(image_edit) if teacache_transformer else None
         else:
-            teacache_transformer(image_edit)
+            if teacache_transformer:
+                teacache_transformer(image_edit)
     else:
         if args.ring_degree * args.ulysses_degree * args.cfg_degree != 1:
-            cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
-            parallel_transformer(image_edit)
+            if XFUSER_AVAILABLE:
+                cfg_usp_level_setting(args.ring_degree, args.ulysses_degree, args.cfg_degree)
+                parallel_transformer(image_edit)
+            else:
+                print("Warning: Parallel processing requested but xfuser not available. Running in single-device mode.")
 
     time_list = []
     for image_name, prompt in image_and_prompts.items():
