@@ -739,8 +739,9 @@ def main():
         device = resolve_device(args.device)
         print(f"Using device: {device}")
     except ValueError as e:
-        print(f"Error: {e}")
-        return 1
+        import sys
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     args.output_dir = args.output_dir.rstrip('/') + ('-offload' if args.offload else "") + ('-quantized' if args.quantized else "") + f"-{args.size_level}"
     os.makedirs(args.output_dir, exist_ok=True)

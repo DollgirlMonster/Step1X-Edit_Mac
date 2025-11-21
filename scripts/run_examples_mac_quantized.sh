@@ -7,6 +7,13 @@ set -e  # Exit immediately if any command fails
 # IMPORTANT: Update the model_path below to point to your Step1X-Edit model directory
 MODEL_PATH="/path/to/step1x-edit/"  # CHANGE THIS to your actual model path
 
+# Validate that model path exists
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "Error: Model path '$MODEL_PATH' does not exist."
+    echo "Please update MODEL_PATH in this script to point to your Step1X-Edit model directory."
+    exit 1
+fi
+
 python inference.py --input_dir ./examples \
     --model_path "$MODEL_PATH" \
     --json_path ./examples/prompt_en.json \
