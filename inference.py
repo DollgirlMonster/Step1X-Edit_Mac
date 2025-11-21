@@ -51,6 +51,67 @@ except ImportError:
         else:
             return torch.device("cpu")
 
+def resolve_device(device_str: str) -> str:
+    """
+    Resolve device string to actual available device.
+    
+    Args:
+        device_str: One of 'auto', 'cuda', 'mps', 'cpu'
+    
+    Returns:
+        Resolved device string
+    
+    Raises:
+        ValueError: If requested device is not available
+    """
+    if device_str == 'auto':
+        if HAS_CUDA:
+            return 'cuda'
+        elif HAS_MPS:
+            return 'mps'
+        else:
+            return 'cpu'
+    elif device_str == 'cuda':
+        if not HAS_CUDA:
+            if HAS_MPS:
+                print("Warning: CUDA requested but not available. Using MPS instead.")
+                return 'mps'
+            else:
+                raise ValueError("CUDA is not available on this system")
+        return 'cuda'
+    elif device_str == 'mps':
+        if not HAS_MPS:
+            raise ValueError("MPS is not available on this system")
+        return 'mps'
+    elif device_str == 'cpu':
+        return 'cpu'
+    else:
+        raise ValueError(f"Unknown device: {device_str}")
+
+def get_attention_mode(mode: str, device: str) -> str:
+    """
+    Determine appropriate attention mode based on device and flash-attn availability.
+    
+    Args:
+        mode: Requested attention mode ('flash', 'torch', 'vanilla', 'xdit')
+        device: Target device ('cuda', 'mps', 'cpu')
+    
+    Returns:
+        Appropriate attention mode
+    """
+    if mode != "flash":
+        return mode
+    
+    try:
+        import flash_attn
+        if device == "mps":
+            print("Flash attention not supported on MPS, using 'torch' mode")
+            return "torch"
+        return "flash"
+    except ImportError:
+        print("Flash attention not available, using 'torch' mode")
+        return "torch"
+
 def cfg_usp_level_setting(ring_degree: int = 1, ulysses_degree: int = 1, cfg_degree: int = 1):
     # restriction: dist.get_world_size() == <cfg_degree> x <ring_degree> x <ulysses_degree>
     initialize_model_parallel(
@@ -107,22 +168,9 @@ def load_models(
     dtype=torch.bfloat16,
     version='v1.0'
 ):
-    # Auto-detect device if using default
-    if device == "cuda" and not HAS_CUDA and HAS_MPS:
-        device = "mps"
-        print(f"CUDA not available, using MPS device instead")
-    
-    # Determine attention mode based on device and flash-attn availability
-    if mode == "flash":
-        try:
-            import flash_attn
-            if device == "mps":
-                # Flash attention not supported on MPS, fall back to torch
-                mode = "torch"
-                print(f"Flash attention not supported on MPS, using 'torch' mode")
-        except ImportError:
-            mode = "torch"
-            print(f"Flash attention not available, using 'torch' mode")
+    # Resolve device and attention mode
+    device = resolve_device(device if device != "cuda" else "auto")
+    mode = get_attention_mode(mode, device)
     
     qwen2vl_encoder = Qwen2VLEmbedder(
         qwen2vl_model_path,
@@ -204,14 +252,8 @@ class ImageGenerator:
             torch.cuda.set_device(local_rank)
             self.device = torch.device(f"cuda:{local_rank}")
         else:
-            # Auto-detect device if using default "cuda"
-            if device == "cuda" and not HAS_CUDA:
-                if HAS_MPS:
-                    device = "mps"
-                    print(f"CUDA not available, using MPS device")
-                else:
-                    device = "cpu"
-                    print(f"No GPU available, using CPU")
+            # Resolve device using helper function
+            device = resolve_device(device if device != "cuda" else "auto")
             self.device = torch.device(device)
 
         self.ae, self.dit, self.llm_encoder = load_models(
@@ -688,22 +730,13 @@ def main():
     assert os.path.exists(args.input_dir), f"Input directory {args.input_dir} does not exist."
     assert os.path.exists(args.json_path), f"JSON file {args.json_path} does not exist."
 
-    # Determine device
-    if args.device == 'auto':
-        if HAS_CUDA:
-            device = 'cuda'
-        elif HAS_MPS:
-            device = 'mps'
-        else:
-            device = 'cpu'
-        print(f"Auto-detected device: {device}")
-    else:
-        device = args.device
-        # Validate device availability
-        if device == 'cuda' and not HAS_CUDA:
-            raise ValueError("CUDA is not available on this system")
-        elif device == 'mps' and not HAS_MPS:
-            raise ValueError("MPS is not available on this system")
+    # Determine device using helper function
+    try:
+        device = resolve_device(args.device)
+        print(f"Using device: {device}")
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
 
     args.output_dir = args.output_dir.rstrip('/') + ('-offload' if args.offload else "") + ('-quantized' if args.quantized else "") + f"-{args.size_level}"
     os.makedirs(args.output_dir, exist_ok=True)

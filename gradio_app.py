@@ -45,6 +45,67 @@ except ImportError:
         else:
             return torch.device("cpu")
 
+def resolve_device(device_str: str) -> str:
+    """
+    Resolve device string to actual available device.
+    
+    Args:
+        device_str: One of 'auto', 'cuda', 'mps', 'cpu'
+    
+    Returns:
+        Resolved device string
+    
+    Raises:
+        ValueError: If requested device is not available
+    """
+    if device_str == 'auto':
+        if HAS_CUDA:
+            return 'cuda'
+        elif HAS_MPS:
+            return 'mps'
+        else:
+            return 'cpu'
+    elif device_str == 'cuda':
+        if not HAS_CUDA:
+            if HAS_MPS:
+                print("Warning: CUDA requested but not available. Using MPS instead.")
+                return 'mps'
+            else:
+                raise ValueError("CUDA is not available on this system")
+        return 'cuda'
+    elif device_str == 'mps':
+        if not HAS_MPS:
+            raise ValueError("MPS is not available on this system")
+        return 'mps'
+    elif device_str == 'cpu':
+        return 'cpu'
+    else:
+        raise ValueError(f"Unknown device: {device_str}")
+
+def get_attention_mode(mode: str, device: str) -> str:
+    """
+    Determine appropriate attention mode based on device and flash-attn availability.
+    
+    Args:
+        mode: Requested attention mode ('flash', 'torch', 'vanilla', 'xdit')
+        device: Target device ('cuda', 'mps', 'cpu')
+    
+    Returns:
+        Appropriate attention mode
+    """
+    if mode != "flash":
+        return mode
+    
+    try:
+        import flash_attn
+        if device == "mps":
+            print("Flash attention not supported on MPS, using 'torch' mode")
+            return "torch"
+        return "flash"
+    except ImportError:
+        print("Flash attention not available, using 'torch' mode")
+        return "torch"
+
 print("TORCH_CUDA", torch.cuda.is_available())
 print("TORCH_MPS", HAS_MPS)
 
@@ -84,22 +145,9 @@ def load_models(
     max_length=256,
     dtype=torch.bfloat16,
 ):
-    # Auto-detect device if using default
-    if device == "cuda" and not HAS_CUDA and HAS_MPS:
-        device = "mps"
-        print(f"CUDA not available, using MPS device instead")
-    
-    # Determine attention mode based on device and flash-attn availability
-    mode = "flash"
-    try:
-        import flash_attn
-        if device == "mps":
-            # Flash attention not supported on MPS, fall back to torch
-            mode = "torch"
-            print(f"Flash attention not supported on MPS, using 'torch' mode")
-    except ImportError:
-        mode = "torch"
-        print(f"Flash attention not available, using 'torch' mode")
+    # Resolve device and attention mode
+    device = resolve_device(device if device != "cuda" else "auto")
+    mode = get_attention_mode("flash", device)
     
     qwen2vl_encoder = Qwen2VLEmbedder(
         qwen2vl_model_path,
@@ -172,14 +220,8 @@ class ImageGenerator:
         offload=False,
         lora=None,
     ) -> None:
-        # Auto-detect device if using default "cuda"
-        if device == "cuda" and not HAS_CUDA:
-            if HAS_MPS:
-                device = "mps"
-                print(f"CUDA not available, using MPS device")
-            else:
-                device = "cpu"
-                print(f"No GPU available, using CPU")
+        # Resolve device using helper function
+        device = resolve_device(device if device != "cuda" else "auto")
         self.device = torch.device(device)
         
         self.ae, self.dit, self.llm_encoder = load_models(
@@ -507,22 +549,13 @@ def prepare_infer_func(args):
     # 本地保存路径
     model_path = args.model_path
 
-    # Determine device
-    if args.device == 'auto':
-        if HAS_CUDA:
-            device = 'cuda'
-        elif HAS_MPS:
-            device = 'mps'
-        else:
-            device = 'cpu'
-        print(f"Auto-detected device: {device}")
-    else:
-        device = args.device
-        # Validate device availability
-        if device == 'cuda' and not HAS_CUDA:
-            raise ValueError("CUDA is not available on this system")
-        elif device == 'mps' and not HAS_MPS:
-            raise ValueError("MPS is not available on this system")
+    # Determine device using helper function
+    try:
+        device = resolve_device(args.device)
+        print(f"Using device: {device}")
+    except ValueError as e:
+        print(f"Error: {e}")
+        raise
 
     image_edit = ImageGenerator(
         ae_path=os.path.join(model_path, 'vae.safetensors'),

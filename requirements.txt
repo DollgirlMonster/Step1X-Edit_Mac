@@ -9,9 +9,9 @@ safetensors==0.4.5
 pillow==11.1.0
 gradio==5.29.0
 
-# flash-attn (optional on MacOS - not available for M-Series chips)
+# flash-attn (optional on macOS - not available for M-Series chips)
 # For CUDA/Linux systems, install flash-attn separately following the instructions in README
-# For M-Series MacOS, the model will automatically use PyTorch's native attention
+# For M-Series macOS, the model will automatically use PyTorch's native attention
 
 # for finetuning
 accelerate==0.34.2
